@@ -1,24 +1,26 @@
+from __future__ import annotations
+
 # built-in
 from collections import defaultdict
+from itertools import zip_longest
+from typing import Any, Sequence, TypeVar
+
+# app
+from .base import Base as _Base, BaseSimilarity as _BaseSimilarity
+from .types import SimFunc, TestFunc
+
+
 try:
-    # python3
-    from itertools import zip_longest
-except ImportError:
-    # python2
-    from itertools import izip_longest as zip_longest
-# external
-try:
+    # external
     import numpy
 except ImportError:
-    numpy = None
-# project
-from .base import Base as _Base, BaseSimilarity as _BaseSimilarity
+    numpy = None  # type: ignore[assignment]
 
 
 __all__ = [
     'Hamming', 'MLIPNS',
     'Levenshtein', 'DamerauLevenshtein',
-    'JaroWinkler', 'StrCmp95',
+    'Jaro', 'JaroWinkler', 'StrCmp95',
     'NeedlemanWunsch', 'Gotoh', 'SmithWaterman',
 
     'hamming', 'mlipns',
@@ -26,28 +28,43 @@ __all__ = [
     'jaro', 'jaro_winkler', 'strcmp95',
     'needleman_wunsch', 'gotoh', 'smith_waterman',
 ]
+T = TypeVar('T')
 
 
 class Hamming(_Base):
-    '''
+    """
     Compute the Hamming distance between the two or more sequences.
     The Hamming distance is the number of differing items in ordered sequences.
 
     https://en.wikipedia.org/wiki/Hamming_distance
-    '''
-    def __init__(self, qval=1, test_func=None, truncate=False):
+    """
+
+    def __init__(
+        self,
+        qval: int = 1,
+        test_func: TestFunc | None = None,
+        truncate: bool = False,
+        external: bool = True,
+    ) -> None:
         self.qval = qval
         self.test_func = test_func or self._ident
         self.truncate = truncate
+        self.external = external
 
-    def __call__(self, *sequences):
+    def __call__(self, *sequences: Sequence[object]) -> int:
         sequences = self._get_sequences(*sequences)
+
+        result = self.quick_answer(*sequences)
+        if result is not None:
+            assert isinstance(result, int)
+            return result
+
         _zip = zip if self.truncate else zip_longest
-        return sum([not self.test_func(*es) for es in _zip(*sequences)])
+        return sum(not self.test_func(*es) for es in _zip(*sequences))
 
 
 class Levenshtein(_Base):
-    '''
+    """
     Compute the absolute Levenshtein distance between the two sequences.
     The Levenshtein distance is the minimum number of edit operations necessary
     for transforming one sequence into the other. The edit operations allowed are:
@@ -58,13 +75,20 @@ class Levenshtein(_Base):
 
     https://en.wikipedia.org/wiki/Levenshtein_distance
     TODO: https://gist.github.com/kylebgorman/1081951/9b38b7743a3cb5167ab2c6608ac8eea7fc629dca
-    '''
-    def __init__(self, qval=1, test_func=None):
+    """
+
+    def __init__(
+        self,
+        qval: int = 1,
+        test_func: TestFunc | None = None,
+        external: bool = True,
+    ) -> None:
         self.qval = qval
         self.test_func = test_func or self._ident
+        self.external = external
 
-    def __call__(self, s1, s2):
-        s1, s2 = self._get_sequences(s1, s2)
+    def _recursive(self, s1: Sequence[T], s2: Sequence[T]) -> int:
+        # TODO: more than 2 sequences support
         if not s1 or not s2:
             return len(s1) + len(s2)
 
@@ -80,9 +104,43 @@ class Levenshtein(_Base):
         s = self(s1[:-1], s2[:-1])
         return min(d, s) + 1
 
+    def _cycled(self, s1: Sequence[T], s2: Sequence[T]) -> int:
+        """
+        source:
+        https://github.com/jamesturk/jellyfish/blob/master/jellyfish/_jellyfish.py#L18
+        """
+        rows = len(s1) + 1
+        cols = len(s2) + 1
+        prev = None
+        cur: Any
+        if numpy:
+            cur = numpy.arange(cols)
+        else:
+            cur = range(cols)
+
+        for r in range(1, rows):
+            prev, cur = cur, [r] + [0] * (cols - 1)
+            for c in range(1, cols):
+                deletion = prev[c] + 1
+                insertion = cur[c - 1] + 1
+                dist = self.test_func(s1[r - 1], s2[c - 1])
+                edit = prev[c - 1] + (not dist)
+                cur[c] = min(edit, deletion, insertion)
+        return int(cur[-1])
+
+    def __call__(self, s1: Sequence[T], s2: Sequence[T]) -> int:
+        s1, s2 = self._get_sequences(s1, s2)
+
+        result = self.quick_answer(s1, s2)
+        if result is not None:
+            assert isinstance(result, int)
+            return result
+
+        return self._cycled(s1, s2)
+
 
 class DamerauLevenshtein(_Base):
-    '''
+    """
     Compute the absolute Damerau-Levenshtein distance between the two sequences.
     The Damerau-Levenshtein distance is the minimum number of edit operations necessary
     for transforming one sequence into the other. The edit operations allowed are:
@@ -91,20 +149,105 @@ class DamerauLevenshtein(_Base):
         * insertion:     ABC -> ABCD, EABC, AEBC..
         * substitution:  ABC -> ABE, ADC, FBC..
         * transposition: ABC -> ACB, BAC
-    
+
+    If `restricted=False`, it will calculate unrestricted distance,
+    where the same character can be touched more than once.
+    So the distance between BA and ACB is 2: BA -> AB -> ACB.
+
     https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance
-    '''
-    def __init__(self, qval=1, test_func=None):
+    """
+
+    def __init__(
+        self,
+        qval: int = 1,
+        test_func: TestFunc | None = None,
+        external: bool = True,
+        restricted: bool = True,
+    ) -> None:
         self.qval = qval
         self.test_func = test_func or self._ident
+        self.external = external
+        self.restricted = restricted
 
-    def __call__(self, s1, s2):
-        s1, s2 = self._get_sequences(s1, s2)
-        result = self.quick_answer(s1, s2)
-        if result is not None:
-            return result
+    def _numpy(self, s1: Sequence[T], s2: Sequence[T]) -> int:
+        # TODO: doesn't pass tests, need improve
+        d = numpy.zeros([len(s1) + 1, len(s2) + 1], dtype=int)
 
-        d = {}
+        # matrix
+        for i in range(-1, len(s1) + 1):
+            d[i][-1] = i + 1
+        for j in range(-1, len(s2) + 1):
+            d[-1][j] = j + 1
+
+        for i, cs1 in enumerate(s1):
+            for j, cs2 in enumerate(s2):
+                cost = int(not self.test_func(cs1, cs2))
+                # ^ 0 if equal, 1 otherwise
+
+                d[i][j] = min(
+                    d[i - 1][j] + 1,            # deletion
+                    d[i][j - 1] + 1,            # insertion
+                    d[i - 1][j - 1] + cost,     # substitution
+                )
+
+                # transposition
+                if not i or not j:
+                    continue
+                if not self.test_func(cs1, s2[j - 1]):
+                    continue
+                d[i][j] = min(
+                    d[i][j],
+                    d[i - 2][j - 2] + cost,
+                )
+
+        return d[len(s1) - 1][len(s2) - 1]
+
+    def _pure_python_unrestricted(self, s1: Sequence[T], s2: Sequence[T]) -> int:
+        """https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance
+        """
+        d: dict[tuple[int, int], int] = {}
+        da: dict[T, int] = {}
+
+        len1 = len(s1)
+        len2 = len(s2)
+
+        maxdist = len1 + len2
+        d[-1, -1] = maxdist
+
+        # matrix
+        for i in range(len(s1) + 1):
+            d[i, -1] = maxdist
+            d[i, 0] = i
+        for j in range(len(s2) + 1):
+            d[-1, j] = maxdist
+            d[0, j] = j
+
+        for i, cs1 in enumerate(s1, start=1):
+            db = 0
+            for j, cs2 in enumerate(s2, start=1):
+                i1 = da.get(cs2, 0)
+                j1 = db
+                if self.test_func(cs1, cs2):
+                    cost = 0
+                    db = j
+                else:
+                    cost = 1
+
+                d[i, j] = min(
+                    d[i - 1, j - 1] + cost,     # substitution
+                    d[i, j - 1] + 1,            # insertion
+                    d[i - 1, j] + 1,            # deletion
+                    d[i1 - 1, j1 - 1] + (i - i1) - 1 + (j - j1),  # transposition
+                )
+            da[cs1] = i
+
+        return d[len1, len2]
+
+    def _pure_python_restricted(self, s1: Sequence[T], s2: Sequence[T]) -> int:
+        """
+        https://www.guyrutenberg.com/2008/12/15/damerau-levenshtein-distance-in-python/
+        """
+        d: dict[tuple[int, int], int] = {}
 
         # matrix
         for i in range(-1, len(s1) + 1):
@@ -128,12 +271,28 @@ class DamerauLevenshtein(_Base):
                     continue
                 if not self.test_func(cs1, s2[j - 1]):
                     continue
+                if not self.test_func(s1[i - 1], cs2):
+                    continue
                 d[i, j] = min(
                     d[i, j],
                     d[i - 2, j - 2] + cost,
                 )
 
         return d[len(s1) - 1, len(s2) - 1]
+
+    def __call__(self, s1: Sequence[T], s2: Sequence[T]) -> int:
+        s1, s2 = self._get_sequences(s1, s2)
+
+        result = self.quick_answer(s1, s2)
+        if result is not None:
+            return result  # type: ignore[return-value]
+
+        # if numpy:
+        #     return self._numpy(s1, s2)
+        # else:
+        if self.restricted:
+            return self._pure_python_restricted(s1, s2)
+        return self._pure_python_unrestricted(s1, s2)
 
 
 class JaroWinkler(_BaseSimilarity):
@@ -144,19 +303,28 @@ class JaroWinkler(_BaseSimilarity):
     and thus are likely to match.
 
     https://en.wikipedia.org/wiki/Jaro%E2%80%93Winkler_distance
-    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/distance/jaro.js
-    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/distance/jaro-winkler.js
+    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/jaro.js
+    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/jaro-winkler.js
     """
-    def __init__(self, long_tolerance=False, winklerize=True, qval=1):
+
+    def __init__(
+        self,
+        long_tolerance: bool = False,
+        winklerize: bool = True,
+        qval: int = 1,
+        external: bool = True,
+    ) -> None:
         self.qval = qval
         self.long_tolerance = long_tolerance
         self.winklerize = winklerize
+        self.external = external
 
-    def maximum(self, *sequences):
+    def maximum(self, *sequences: Sequence[object]) -> int:
         return 1
 
-    def __call__(self, s1, s2, prefix_weight=0.1):
+    def __call__(self, s1: Sequence[T], s2: Sequence[T], prefix_weight: float = 0.1) -> float:
         s1, s2 = self._get_sequences(s1, s2)
+
         result = self.quick_answer(s1, s2)
         if result is not None:
             return result
@@ -167,20 +335,21 @@ class JaroWinkler(_BaseSimilarity):
         if not s1_len or not s2_len:
             return 0.0
 
-        min_len = max(s1_len, s2_len)
-        search_range = (min_len // 2) - 1
+        min_len = min(s1_len, s2_len)
+        search_range = max(s1_len, s2_len)
+        search_range = (search_range // 2) - 1
         if search_range < 0:
             search_range = 0
 
-        s1_flags = [False]*s1_len
-        s2_flags = [False]*s2_len
+        s1_flags = [False] * s1_len
+        s2_flags = [False] * s2_len
 
         # looking only within search range, count & flag matched pairs
         common_chars = 0
         for i, s1_ch in enumerate(s1):
-            low = i - search_range if i > search_range else 0
-            hi = i + search_range if i + search_range < s2_len else s2_len - 1
-            for j in range(low, hi+1):
+            low = max(0, i - search_range)
+            hi = min(i + search_range, s2_len - 1)
+            for j in range(low, hi + 1):
                 if not s2_flags[j] and s2[j] == s1_ch:
                     s1_flags[i] = s2_flags[j] = True
                     common_chars += 1
@@ -200,10 +369,9 @@ class JaroWinkler(_BaseSimilarity):
                         break
                 if s1[i] != s2[j]:
                     trans_count += 1
-        trans_count /= 2
+        trans_count //= 2
 
         # adjust for similarities in nonmatched characters
-        common_chars = float(common_chars)
         weight = common_chars / s1_len + common_chars / s2_len
         weight += (common_chars - trans_count) / common_chars
         weight /= 3
@@ -211,14 +379,14 @@ class JaroWinkler(_BaseSimilarity):
         # stop to boost if strings are not similar
         if not self.winklerize:
             return weight
-        if weight <= 0.7 or s1_len <= 3 or s2_len <= 3:
+        if weight <= 0.7:
             return weight
 
         # winkler modification
         # adjust for up to first 4 chars in common
         j = min(min_len, 4)
         i = 0
-        while i < j and s1[i] == s2[i] and s1[i]:
+        while i < j and s1[i] == s2[i]:
             i += 1
         if i:
             weight += i * prefix_weight * (1.0 - weight)
@@ -228,11 +396,26 @@ class JaroWinkler(_BaseSimilarity):
         # agreed characters must be > half of remaining characters
         if not self.long_tolerance or min_len <= 4:
             return weight
-        if common_chars < i or 2 * common_chars < min_len + i:
+        if common_chars <= i + 1 or 2 * common_chars < min_len + i:
             return weight
-        tmp = float(common_chars - i - 1) / (s1_len + s2_len - i * 2 + 2)
+        tmp = (common_chars - i - 1) / (s1_len + s2_len - i * 2 + 2)
         weight += (1.0 - weight) * tmp
         return weight
+
+
+class Jaro(JaroWinkler):
+    def __init__(
+        self,
+        long_tolerance: bool = False,
+        qval: int = 1,
+        external: bool = True,
+    ) -> None:
+        super().__init__(
+            long_tolerance=long_tolerance,
+            winklerize=False,
+            qval=qval,
+            external=external,
+        )
 
 
 class NeedlemanWunsch(_BaseSimilarity):
@@ -247,28 +430,64 @@ class NeedlemanWunsch(_BaseSimilarity):
 
     https://en.wikipedia.org/wiki/Needleman%E2%80%93Wunsch_algorithm
     """
-    def __init__(self, gap_cost=1.0, sim_func=None, qval=1):
+
+    def __init__(
+        self,
+        gap_cost: float = 1.0,
+        sim_func: SimFunc = None,
+        qval: int = 1,
+        external: bool = True,
+    ) -> None:
         self.qval = qval
         self.gap_cost = gap_cost
         if sim_func:
             self.sim_func = sim_func
         else:
             self.sim_func = self._ident
+        self.external = external
 
-    def maximum(self, *sequences):
-        return min(map(len, sequences))
+    def minimum(self, *sequences: Sequence[object]) -> float:
+        return -max(map(len, sequences)) * self.gap_cost
 
-    def __call__(self, s1, s2):
+    def maximum(self, *sequences: Sequence[object]) -> float:
+        return max(map(len, sequences))
+
+    def distance(self, *sequences: Sequence[object]) -> float:
+        """Get distance between sequences
+        """
+        return -1 * self.similarity(*sequences)
+
+    def normalized_distance(self, *sequences: Sequence[object]) -> float:
+        """Get distance from 0 to 1
+        """
+        minimum = self.minimum(*sequences)
+        maximum = self.maximum(*sequences)
+        if maximum == 0:
+            return 0
+        return (self.distance(*sequences) - minimum) / (maximum - minimum)
+
+    def normalized_similarity(self, *sequences: Sequence[object]) -> float:
+        """Get similarity from 0 to 1
+        """
+        minimum = self.minimum(*sequences)
+        maximum = self.maximum(*sequences)
+        if maximum == 0:
+            return 1
+        return (self.similarity(*sequences) - minimum) / (maximum * 2)
+
+    def __call__(self, s1: Sequence[T], s2: Sequence[T]) -> float:
         if not numpy:
             raise ImportError('Please, install numpy for Needleman-Wunsch measure')
+
         s1, s2 = self._get_sequences(s1, s2)
-        result = self.quick_answer(s1, s2)
-        if result is not None:
-            return result
+
+        # result = self.quick_answer(s1, s2)
+        # if result is not None:
+        #     return result * self.maximum(s1, s2)
 
         dist_mat = numpy.zeros(
             (len(s1) + 1, len(s2) + 1),
-            dtype=numpy.float,
+            dtype=float,
         )
         # DP initialization
         for i in range(len(s1) + 1):
@@ -277,9 +496,9 @@ class NeedlemanWunsch(_BaseSimilarity):
         for j in range(len(s2) + 1):
             dist_mat[0, j] = -(j * self.gap_cost)
         # Needleman-Wunsch DP calculation
-        for i in range(1, len(s1) + 1):
-            for j in range(1, len(s2) + 1):
-                match = dist_mat[i - 1, j - 1] + self.sim_func(s1[i - 1], s2[j - 1])
+        for i, c1 in enumerate(s1, 1):
+            for j, c2 in enumerate(s2, 1):
+                match = dist_mat[i - 1, j - 1] + self.sim_func(c1, c2)
                 delete = dist_mat[i - 1, j] - self.gap_cost
                 insert = dist_mat[i, j - 1] - self.gap_cost
                 dist_mat[i, j] = max(match, delete, insert)
@@ -295,32 +514,41 @@ class SmithWaterman(_BaseSimilarity):
     segments of all possible lengths and optimizes the similarity measure.
 
     https://en.wikipedia.org/wiki/Smith%E2%80%93Waterman_algorithm
-    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/distance/smith-waterman.js
+    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/smith-waterman.js
     """
-    def __init__(self, gap_cost=1.0, sim_func=None, qval=1):
+
+    def __init__(
+        self,
+        gap_cost: float = 1.0,
+        sim_func: SimFunc = None,
+        qval: int = 1,
+        external: bool = True,
+    ) -> None:
         self.qval = qval
         self.gap_cost = gap_cost
         self.sim_func = sim_func or self._ident
+        self.external = external
 
-    def maximum(self, *sequences):
+    def maximum(self, *sequences: Sequence[object]) -> int:
         return min(map(len, sequences))
 
-    def __call__(self, s1, s2):
+    def __call__(self, s1: Sequence[T], s2: Sequence[T]) -> float:
         if not numpy:
             raise ImportError('Please, install numpy for Smith-Waterman measure')
+
         s1, s2 = self._get_sequences(s1, s2)
+
         result = self.quick_answer(s1, s2)
         if result is not None:
             return result
 
         dist_mat = numpy.zeros(
             (len(s1) + 1, len(s2) + 1),
-            dtype=numpy.float,
+            dtype=float,
         )
-        max_value = 0
         for i, sc1 in enumerate(s1, start=1):
             for j, sc2 in enumerate(s2, start=1):
-                # The score for substituting the letter a[i-1] for b[j-1].
+                # The score for substituting the letter a[i - 1] for b[j - 1].
                 # Generally low for mismatch, high for match.
                 match = dist_mat[i - 1, j - 1] + self.sim_func(sc1, sc2)
                 # The scores for for introducing extra letters in one of the strings
@@ -328,16 +556,24 @@ class SmithWaterman(_BaseSimilarity):
                 delete = dist_mat[i - 1, j] - self.gap_cost
                 insert = dist_mat[i, j - 1] - self.gap_cost
                 dist_mat[i, j] = max(0, match, delete, insert)
-        return dist_mat[dist_mat.shape[0]-1, dist_mat.shape[1]-1]
+        return dist_mat[dist_mat.shape[0] - 1, dist_mat.shape[1] - 1]
 
 
-class Gotoh(_BaseSimilarity):
+class Gotoh(NeedlemanWunsch):
     """Gotoh score
     Gotoh's algorithm is essentially Needleman-Wunsch with affine gap
     penalties:
     https://www.cs.umd.edu/class/spring2003/cmsc838t/papers/gotoh1982.pdf
     """
-    def __init__(self, gap_open=1, gap_ext=0.4, sim_func=None, qval=1):
+
+    def __init__(
+        self,
+        gap_open: int = 1,
+        gap_ext: float = 0.4,
+        sim_func: SimFunc = None,
+        qval: int = 1,
+        external: bool = True,
+    ) -> None:
         self.qval = qval
         self.gap_open = gap_open
         self.gap_ext = gap_ext
@@ -345,21 +581,29 @@ class Gotoh(_BaseSimilarity):
             self.sim_func = sim_func
         else:
             self.sim_func = self._ident
+        self.external = external
 
-    def maximum(self, *sequences):
+    def minimum(self, *sequences: Sequence[object]) -> int:
+        return -min(map(len, sequences))
+
+    def maximum(self, *sequences: Sequence[object]) -> int:
         return min(map(len, sequences))
 
-    def __call__(self, s1, s2):
+    def __call__(self, s1: Sequence[T], s2: Sequence[T]) -> float:
+        if not numpy:
+            raise ImportError('Please, install numpy for Gotoh measure')
+
         s1, s2 = self._get_sequences(s1, s2)
-        result = self.quick_answer(s1, s2)
-        if result is not None:
-            return result
+
+        # result = self.quick_answer(s1, s2)
+        # if result is not None:
+        #     return result * self.maximum(s1, s2)
 
         len_s1 = len(s1)
         len_s2 = len(s2)
-        d_mat = numpy.zeros((len_s1 + 1, len_s2 + 1), dtype=numpy.float)
-        p_mat = numpy.zeros((len_s1 + 1, len_s2 + 1), dtype=numpy.float)
-        q_mat = numpy.zeros((len_s1 + 1, len_s2 + 1), dtype=numpy.float)
+        d_mat = numpy.zeros((len_s1 + 1, len_s2 + 1), dtype=float)
+        p_mat = numpy.zeros((len_s1 + 1, len_s2 + 1), dtype=float)
+        q_mat = numpy.zeros((len_s1 + 1, len_s2 + 1), dtype=float)
 
         d_mat[0, 0] = 0
         p_mat[0, 0] = float('-inf')
@@ -379,17 +623,17 @@ class Gotoh(_BaseSimilarity):
             for j, sc2 in enumerate(s2, start=1):
                 sim_val = self.sim_func(sc1, sc2)
                 d_mat[i, j] = max(
-                    d_mat[i-1, j-1] + sim_val,
-                    p_mat[i-1, j-1] + sim_val,
-                    q_mat[i-1, j-1] + sim_val,
+                    d_mat[i - 1, j - 1] + sim_val,
+                    p_mat[i - 1, j - 1] + sim_val,
+                    q_mat[i - 1, j - 1] + sim_val,
                 )
                 p_mat[i, j] = max(
-                    d_mat[i-1, j] - self.gap_open,
-                    p_mat[i-1, j] - self.gap_ext,
+                    d_mat[i - 1, j] - self.gap_open,
+                    p_mat[i - 1, j] - self.gap_ext,
                 )
                 q_mat[i, j] = max(
-                    d_mat[i, j-1] - self.gap_open,
-                    q_mat[i, j-1] - self.gap_ext,
+                    d_mat[i, j - 1] - self.gap_open,
+                    q_mat[i, j - 1] - self.gap_ext,
                 )
 
         i, j = (n - 1 for n in d_mat.shape)
@@ -401,28 +645,30 @@ class StrCmp95(_BaseSimilarity):
 
     http://cpansearch.perl.org/src/SCW/Text-JaroWinkler-0.1/strcmp95.c
     """
-    sp_mx = (
+    sp_mx: tuple[tuple[str, str], ...] = (
         ('A', 'E'), ('A', 'I'), ('A', 'O'), ('A', 'U'), ('B', 'V'), ('E', 'I'),
         ('E', 'O'), ('E', 'U'), ('I', 'O'), ('I', 'U'), ('O', 'U'), ('I', 'Y'),
         ('E', 'Y'), ('C', 'G'), ('E', 'F'), ('W', 'U'), ('W', 'V'), ('X', 'K'),
         ('S', 'Z'), ('X', 'S'), ('Q', 'C'), ('U', 'V'), ('M', 'N'), ('L', 'I'),
         ('Q', 'O'), ('P', 'R'), ('I', 'J'), ('2', 'Z'), ('5', 'S'), ('8', 'B'),
-        ('1', 'I'), ('1', 'L'), ('0', 'O'), ('0', 'Q'), ('C', 'K'), ('G', 'J')
+        ('1', 'I'), ('1', 'L'), ('0', 'O'), ('0', 'Q'), ('C', 'K'), ('G', 'J'),
     )
 
-    def __init__(self, long_strings=False):
+    def __init__(self, long_strings: bool = False, external: bool = True) -> None:
         self.long_strings = long_strings
+        self.external = external
 
-    def maximum(self, *sequences):
+    def maximum(self, *sequences: Sequence[object]) -> int:
         return 1
 
     @staticmethod
-    def _in_range(char):
+    def _in_range(char) -> bool:
         return 0 < ord(char) < 91
 
-    def __call__(self, s1, s2):
+    def __call__(self, s1: str, s2: str) -> float:
         s1 = s1.strip().upper()
         s2 = s2.strip().upper()
+
         result = self.quick_answer(s1, s2)
         if result is not None:
             return result
@@ -503,8 +749,8 @@ class StrCmp95(_BaseSimilarity):
         num_sim = n_simi / 10.0 + num_com
 
         # Main weight computation
-        weight = float(num_sim) / len_s1 + num_sim / len_s2
-        weight += float(num_com - n_trans) / num_com
+        weight = num_sim / len_s1 + num_sim / len_s2
+        weight += (num_com - n_trans) / num_com
         weight = weight / 3.0
 
         # Continue to boost the weight if the strings are similar
@@ -537,7 +783,7 @@ class StrCmp95(_BaseSimilarity):
             return weight
         if s1[0].isdigit():
             return weight
-        res = (num_com-i-1) / (len_s1+len_s2-i*2+2)
+        res = (num_com - i - 1) / (len_s1 + len_s2 - i * 2 + 2)
         weight += (1.0 - weight) * res
         return weight
 
@@ -548,18 +794,26 @@ class MLIPNS(_BaseSimilarity):
     The Hamming distance is the number of differing items in ordered sequences.
 
     http://www.sial.iias.spb.su/files/386-386-1-PB.pdf
-    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/distance/mlipns.js
+    https://github.com/Yomguithereal/talisman/blob/master/src/metrics/mlipns.js
     """
-    def __init__(self, threshold=0.25, maxmismatches=2, qval=1):
+
+    def __init__(
+        self, threshold: float = 0.25,
+        maxmismatches: int = 2,
+        qval: int = 1,
+        external: bool = True,
+    ) -> None:
         self.qval = qval
         self.threshold = threshold
         self.maxmismatches = maxmismatches
+        self.external = external
 
-    def maximum(self, *sequences):
+    def maximum(self, *sequences: Sequence[object]) -> int:
         return 1
 
-    def __call__(self, *sequences):
+    def __call__(self, *sequences: Sequence[object]) -> float:
         sequences = self._get_sequences(*sequences)
+
         result = self.quick_answer(*sequences)
         if result is not None:
             return result
@@ -570,7 +824,7 @@ class MLIPNS(_BaseSimilarity):
         while all(sequences) and mismatches <= self.maxmismatches:
             if not maxlen:
                 return 1
-            if 1 - float(maxlen - ham) / maxlen <= self.threshold:
+            if 1 - (maxlen - ham) / maxlen <= self.threshold:
                 return 1
             mismatches += 1
             ham -= 1
@@ -584,8 +838,8 @@ class MLIPNS(_BaseSimilarity):
 hamming = Hamming()
 levenshtein = Levenshtein()
 damerau = damerau_levenshtein = DamerauLevenshtein()
-jaro = JaroWinkler(winklerize=False)
-jaro_winkler = JaroWinkler(winklerize=True)
+jaro = Jaro()
+jaro_winkler = JaroWinkler()
 needleman_wunsch = NeedlemanWunsch()
 smith_waterman = SmithWaterman()
 gotoh = Gotoh()
